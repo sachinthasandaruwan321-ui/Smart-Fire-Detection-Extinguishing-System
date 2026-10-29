@@ -1,0 +1,217 @@
+import cv2
+import easyocr
+import numpy as np
+import time
+import os
+import requests
+import threading
+
+# --- CONFIGURATION ---
+ESP32_CAM_IP = "10.226.106.120"
+STREAM_URL = f"http://{ESP32_CAM_IP}:81/stream"
+FIRE_TRIGGER_URL = f"http://{ESP32_CAM_IP}/fire"
+
+TARGET_WORD = "FIRE"
+SAVE_FOLDER = "fire_captures"
+
+MIN_CONFIDENCE = 0.35
+CAPTURE_COOLDOWN_SECONDS = 3
+FIRE_TRIGGER_COOLDOWN_SECONDS = 5
+
+os.makedirs(SAVE_FOLDER, exist_ok=True)
+
+print("Loading EasyOCR...")
+# Set gpu=True if you have a compatible NVIDIA GPU and CUDA installed to make it insanely fast.
+reader = easyocr.Reader(["en"], gpu=False) 
+print("EasyOCR ready.")
+
+# --- SHARED VARIABLES FOR THREADS ---
+latest_frame = None
+frame_lock = threading.Lock()
+
+current_detections = []
+detections_lock = threading.Lock()
+
+running = True
+# ------------------------------------
+
+def normalize_text(text):
+    """Cleans up OCR text to catch misread letters on cardboard."""
+    text = text.upper()
+    text = text.replace(" ", "")
+    text = text.replace("|", "I")
+    text = text.replace("1", "I")
+    text = text.replace("!", "I")
+    text = text.replace("0", "O")
+    return text
+
+def send_fire_trigger():
+    """Sends the HTTP GET request to the ESP32-CAM to trigger the FIRE event."""
+    try:
+        response = requests.get(FIRE_TRIGGER_URL, timeout=2)
+        if response.status_code == 200:
+            print(f"[SUCCESS] Fire trigger sent: {response.text}")
+        else:
+            print(f"[WARNING] ESP32 responded with status code: {response.status_code}")
+    except requests.exceptions.RequestException as error:
+        print(f"[ERROR] Fire trigger failed: {error}")
+
+def save_capture(frame):
+    """Saves the frame to the folder with a timestamp."""
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    filename = os.path.join(SAVE_FOLDER, f"fire_{timestamp}.jpg")
+    cv2.imwrite(filename, frame)
+    print(f"Captured: {filename}")
+
+def ocr_worker_thread():
+    """Background thread that constantly analyzes the latest frame for text."""
+    global latest_frame, current_detections, running
+
+    last_capture_time = 0
+    last_fire_trigger_time = 0
+
+    while running:
+        frame_to_process = None
+        
+        # Safely grab a copy of the newest frame
+        with frame_lock:
+            if latest_frame is not None:
+                frame_to_process = latest_frame.copy()
+
+        if frame_to_process is None:
+            time.sleep(0.01) # Wait briefly if no frame is ready
+            continue
+
+        # Convert to grayscale to speed up OCR slightly
+        gray_frame = cv2.cvtColor(frame_to_process, cv2.COLOR_BGR2GRAY)
+
+        # Run EasyOCR
+        results = reader.readtext(gray_frame)
+        
+        new_detections = []
+        fire_detected_this_frame = False
+
+        for box, text, confidence in results:
+            clean_text = normalize_text(text)
+
+            if confidence >= MIN_CONFIDENCE and TARGET_WORD in clean_text:
+                points = np.array(box, dtype=np.int32)
+                x_min = int(np.min(points[:, 0]))
+                y_min = int(np.min(points[:, 1]))
+                x_max = int(np.max(points[:, 0]))
+                y_max = int(np.max(points[:, 1]))
+
+                new_detections.append({
+                    "box": points,
+                    "rect": (x_min, y_min, x_max, y_max),
+                    "text": text,
+                    "confidence": confidence
+                })
+                fire_detected_this_frame = True
+
+        # Update the shared detections list safely
+        with detections_lock:
+            current_detections = new_detections
+
+        # Handle Cooldowns and Triggers
+        if fire_detected_this_frame:
+            now = time.time()
+            
+            if now - last_capture_time >= CAPTURE_COOLDOWN_SECONDS:
+                save_capture(frame_to_process)
+                last_capture_time = now
+                
+            if now - last_fire_trigger_time >= FIRE_TRIGGER_COOLDOWN_SECONDS:
+                # Trigger in a brief sub-thread so it doesn't slow down the OCR loop
+                threading.Thread(target=send_fire_trigger).start()
+                last_fire_trigger_time = now
+
+def draw_fire_box(frame, detection):
+    """Draws the bounding box and text on the frame."""
+    points = detection["box"]
+    x_min, y_min, x_max, y_max = detection["rect"]
+
+    # Draw polygon around text
+    cv2.polylines(frame, [points], True, (0, 0, 255), 3)
+
+    # Draw label above text
+    cv2.putText(
+        frame,
+        f"FIRE ({detection['confidence']:.2f})",
+        (x_min, max(30, y_min - 10)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (0, 0, 255),
+        2
+    )
+
+def main():
+    global latest_frame, current_detections, running
+
+    print(f"Connecting to ESP32-CAM MJPEG stream at {STREAM_URL}...")
+    
+    # Use the smooth MJPEG stream
+    cap = cv2.VideoCapture(STREAM_URL)
+    
+    # Try to reduce buffering lag to 1 frame
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    if not cap.isOpened():
+        print("[ERROR] Cannot open stream. Check your ESP32 IP address.")
+        return
+
+    print("\n--- SYSTEM ACTIVE ---")
+    print(" -> Background OCR Thread Started.")
+    print(" -> Show cardboard labeled FIRE to the camera.")
+    print(" -> Press 'q' to quit.")
+    print("---------------------\n")
+
+    # Start the background OCR thread
+    ocr_thread = threading.Thread(target=ocr_worker_thread)
+    ocr_thread.start()
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("[ERROR] Connection lost.")
+                break
+
+            # Update the latest frame for the background thread to use
+            with frame_lock:
+                latest_frame = frame
+
+            # Create a copy to draw on
+            display_frame = frame.copy()
+
+            # Safely get the latest detections from the background thread
+            with detections_lock:
+                detections_to_draw = list(current_detections)
+
+            # Draw the boxes
+            for detection in detections_to_draw:
+                draw_fire_box(display_frame, detection)
+
+            # Display the video frame smoothly
+            cv2.imshow("ESP32-CAM Real-Time FIRE Detection", display_frame)
+
+            # Wait 1ms and check for keyboard input
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                print("Quitting...")
+                running = False
+                break
+            elif key == ord('f'): # Keep manual override just in case
+                print(">>> Manual trigger pressed!")
+                threading.Thread(target=send_fire_trigger).start()
+
+    finally:
+        # Cleanup when closed
+        running = False
+        ocr_thread.join()
+        cap.release()
+        cv2.destroyAllWindows()
+        print("System shutdown complete.")
+
+if __name__ == "__main__":
+    main()

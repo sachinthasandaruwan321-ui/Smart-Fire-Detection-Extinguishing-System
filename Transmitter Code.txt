@@ -1,0 +1,248 @@
+#include <esp_now.h>
+#include <WiFi.h>
+#include <Wire.h>
+#include <MPU6050.h>
+#include "esp_wifi.h"
+
+uint8_t baseAddress[] = {0x9C, 0x13, 0x9E, 0xAB, 0x0F, 0xFC};
+
+#define MPU_SDA_PIN 8
+#define MPU_SCL_PIN 9
+
+#define CAM_UART_RX 17
+#define CAM_UART_TX 18
+
+#define FIRE_FLAG 0x01
+
+const float MPU_PAN_SIGN = 1.0;
+const float MPU_TILT_SIGN = 1.0;
+const bool SWAP_MPU_AXES = false;
+
+const float MAX_MPU_PAN_DEG = 45.0;
+const float MAX_MPU_TILT_DEG = 45.0;
+
+const int MPU_SAMPLES = 8;
+const float MPU_DEADBAND_DEG = 1.5;
+const float FILTER_ALPHA = 0.12;
+
+const unsigned long SEND_INTERVAL_MS = 35;
+
+MPU6050 mpu;
+HardwareSerial CamSerial(1);
+
+struct ControlPacket {
+  float pan;
+  float tilt;
+  uint32_t fireEventId;
+  uint8_t flags;
+};
+
+ControlPacket txData;
+esp_now_peer_info_t peerInfo;
+
+// --- Z-Axis (Yaw) Gyro Variables ---
+float gyroZOffset = 0;
+float currentYaw = 0;
+unsigned long lastYawTime = 0;
+
+float centerPitch = 0;
+float filteredPan = 0;
+float filteredTilt = 0;
+
+uint32_t fireEventId = 0;
+String camLine = "";
+unsigned long lastSendTime = 0;
+
+// Read pitch from the Accelerometer
+float readPitch(int16_t ax, int16_t ay, int16_t az) {
+  return atan2(-(float)ax, sqrt((float)ay * ay + (float)az * az)) * 180.0 / PI;
+}
+
+float applyDeadband(float value) {
+  if (abs(value) < MPU_DEADBAND_DEG) {
+    return 0;
+  }
+  return value;
+}
+
+// Reads average Gyro Z and Accelerometer Pitch
+void readMpuData(float &gzOut, float &pitchOut) {
+  long gzSum = 0;
+  float pitchSum = 0;
+
+  for (int i = 0; i < MPU_SAMPLES; i++) {
+    int16_t ax, ay, az, gx, gy, gz;
+    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+
+    gzSum += gz;
+    pitchSum += readPitch(ax, ay, az);
+
+    delay(2);
+  }
+
+  gzOut = (float)gzSum / MPU_SAMPLES;
+  pitchOut = pitchSum / MPU_SAMPLES;
+}
+
+void calibrateMpuCenter() {
+  Serial.println("Keep helmet still. Calibrating MPU Pitch and Gyro Z...");
+
+  long gzSum = 0;
+  float pitchSum = 0;
+  const int samples = 150;
+
+  for (int i = 0; i < samples; i++) {
+    int16_t ax, ay, az, gx, gy, gz;
+    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+
+    gzSum += gz;
+    pitchSum += readPitch(ax, ay, az);
+
+    delay(5);
+  }
+
+  gyroZOffset = (float)gzSum / samples;
+  centerPitch = pitchSum / samples;
+
+  currentYaw = 0;
+  filteredPan = 0;
+  filteredTilt = 0;
+  lastYawTime = millis();
+
+  Serial.print("Gyro Z Offset: ");
+  Serial.println(gyroZOffset);
+  Serial.print("Center Pitch: ");
+  Serial.println(centerPitch);
+}
+
+void handleCamSerial() {
+  while (CamSerial.available()) {
+    char c = CamSerial.read();
+
+    if (c == '\n' || c == '\r') {
+      camLine.trim();
+
+      if (camLine == "FIRE") {
+        fireEventId++;
+        Serial.print("FIRE received from ESP32-CAM. Event ID: ");
+        Serial.println(fireEventId);
+      }
+
+      camLine = "";
+    } else {
+      camLine += c;
+
+      if (camLine.length() > 40) {
+        camLine = "";
+      }
+    }
+  }
+}
+
+void onDataSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {
+  // Commented out to prevent serial flooding, uncomment if debugging connection issues
+  // Serial.print("ESP-NOW Send: ");
+  // Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Success" : "Fail");
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println();
+  Serial.println("Device: HELMET_TX_ESP32S3_MPU_FIRE");
+
+  CamSerial.begin(115200, SERIAL_8N1, CAM_UART_RX, CAM_UART_TX);
+
+  WiFi.mode(WIFI_STA);
+  esp_wifi_set_max_tx_power(40);
+
+  Wire.begin(MPU_SDA_PIN, MPU_SCL_PIN);
+  mpu.initialize();
+
+  if (!mpu.testConnection()) {
+    Serial.println("MPU6050 connection failed");
+  } else {
+    Serial.println("MPU6050 ready");
+  }
+
+  calibrateMpuCenter();
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init failed");
+    return;
+  }
+
+  esp_now_register_send_cb(onDataSent);
+
+  memcpy(peerInfo.peer_addr, baseAddress, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Failed to add receiver peer");
+    return;
+  }
+
+  Serial.println("Transmitter started");
+}
+
+void loop() {
+  handleCamSerial();
+
+  unsigned long now = millis();
+
+  if (now - lastSendTime < SEND_INTERVAL_MS) {
+    return;
+  }
+  lastSendTime = now;
+
+  float gzAvg, pitch;
+  readMpuData(gzAvg, pitch);
+
+  // 1. Calculate time passed (dt) for gyro integration
+  unsigned long currentReadTime = millis();
+  float dt = (currentReadTime - lastYawTime) / 1000.0;
+  lastYawTime = currentReadTime;
+
+  // 2. Convert raw Gyro Z to degrees per second (131.0 LSB is default for +/- 250 deg/s)
+  float gyroZRate = (gzAvg - gyroZOffset) / 131.0;
+
+  // 3. Apply a Gyro Deadband to stop "drifting" when the helmet is perfectly still
+  if (abs(gyroZRate) < 1.0) { // Ignores turning rates less than 1 degree per second
+    gyroZRate = 0;
+  }
+
+  // 4. Integrate the rate to get the current Yaw (Z-Axis Pan)
+  currentYaw += gyroZRate * dt;
+
+  float panValue = currentYaw;
+  float tiltValue = pitch - centerPitch;
+
+  if (SWAP_MPU_AXES) {
+    float temp = panValue;
+    panValue = tiltValue;
+    tiltValue = temp;
+  }
+
+  panValue = applyDeadband(panValue * MPU_PAN_SIGN);
+  tiltValue = applyDeadband(tiltValue * MPU_TILT_SIGN);
+
+  panValue = constrain(panValue, -MAX_MPU_PAN_DEG, MAX_MPU_PAN_DEG);
+  tiltValue = constrain(tiltValue, -MAX_MPU_TILT_DEG, MAX_MPU_TILT_DEG);
+
+  filteredPan = panValue * FILTER_ALPHA + filteredPan * (1.0 - FILTER_ALPHA);
+  filteredTilt = tiltValue * FILTER_ALPHA + filteredTilt * (1.0 - FILTER_ALPHA);
+
+  txData.pan = filteredPan;
+  txData.tilt = filteredTilt;
+  txData.fireEventId = fireEventId;
+  txData.flags = fireEventId > 0 ? FIRE_FLAG : 0;
+
+  esp_now_send(baseAddress, (uint8_t *)&txData, sizeof(txData));
+
+  Serial.printf("Pan (Z-Axis): %.2f | Tilt: %.2f | Fire ID: %lu\n",
+                txData.pan,
+                txData.tilt,
+                (unsigned long)txData.fireEventId);
+}

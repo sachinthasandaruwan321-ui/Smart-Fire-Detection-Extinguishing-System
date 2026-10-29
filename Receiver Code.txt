@@ -1,0 +1,107 @@
+#include <esp_now.h>
+#include <WiFi.h>
+#include <ESP32Servo.h>
+#include "esp_wifi.h"
+
+Servo servoX; Servo servoY;
+const int sXPin = 16; const int sYPin = 17;
+const int joyX = 6;  // වම-දකුණ සඳහා
+const int joyY = 15; // උඩ-පහළ සඳහා
+
+// --- අලුතින් එකතු කළ Pump Pins ---
+const int pumpPin = 21;    
+const int btnHigh = 18;  
+const int btnLow = 8;    
+
+struct DataPacket { float x; float y; } incomingData;
+
+// Smoothness එක සඳහා variables
+float smoothX = 90, smoothY = 90;
+float filterAlpha = 0.1; // 0.01 (වැඩිපුර smooth) සහ 0.5 (වේගවත්) අතර අගයක්
+
+// පවතින සර්වෝ අගයන් (Joystick එකට)
+float currentPosX = 90, currentPosY = 90;
+
+void onDataRecv(const esp_now_recv_info_t * recv_info, const uint8_t *data, int len) {
+  memcpy(&incomingData, data, sizeof(incomingData));
+}
+
+void setup() {
+  Serial.begin(115200);
+  servoX.attach(sXPin); 
+  servoY.attach(sYPin);
+  
+  // --- අලුතින් එකතු කළ Pump Setup ---
+  pinMode(pumpPin, OUTPUT);
+  pinMode(btnHigh, INPUT_PULLUP);
+  pinMode(btnLow, INPUT_PULLUP);
+  digitalWrite(pumpPin, LOW); // ආරම්භයේදී ඕෆ් කරලා තියන්න
+
+  WiFi.mode(WIFI_STA);
+  if (esp_now_init() != ESP_OK) return;
+  esp_now_register_recv_cb(onDataRecv);
+  
+  // ආරම්භක පිහිටීම
+  servoX.write(90);
+  servoY.write(90);
+}
+
+void loop() {
+  int jX = analogRead(joyX);
+  int jY = analogRead(joyY);
+
+  // --- අලුතින් එකතු කළ Pump Buttons කියවීම ---
+  bool highPressed = (digitalRead(btnHigh) == LOW);
+  bool lowPressed = (digitalRead(btnLow) == LOW);
+
+  // ==========================================
+  // 1. Water Pump Control (මෙය Gyro එකට බාධාවක් නොවේ)
+  // ==========================================
+  if (highPressed) {
+    analogWrite(pumpPin, 255); // High Pressure (100%)
+  } 
+  else if (lowPressed) {
+    analogWrite(pumpPin, 120); // Low Pressure (50% - අගය වෙනස් කරගන්න පුළුවන්)
+  } 
+  else {
+    analogWrite(pumpPin, 0);   // බටන් දෙකම අතෑරියම සම්පූර්ණයෙන් ඕෆ්
+  }
+
+  // ==========================================
+  // 2. Servo Control (Joystick Override & Gyro Mode)
+  // ==========================================
+  // Joystick Override Check (සෙන්ටර් එක 2048 ලෙස ගෙන)
+  if (abs(jX - 2048) > 500 || abs(jY - 2048) > 500) {
+    // ජොයිස්ටික් එකෙන් කරන්නේ තිබ්බ තැනට අගයක් එකතු කරන එකයි (Increment)
+    float speed = 0.5; // වේගය වැඩිනම් මේක අඩු කරන්න
+    
+    if (abs(jX - 2048) > 500) currentPosX += (jX > 2048 ? speed : -speed);
+    if (abs(jY - 2048) > 500) currentPosY += (jY > 2048 ? speed : -speed);
+    
+    currentPosX = constrain(currentPosX, 0, 180);
+    currentPosY = constrain(currentPosY, 0, 180);
+    
+    servoX.write((int)currentPosX);
+    servoY.write((int)currentPosY);
+  } 
+  else {
+    // Helmet Gyro Mode - Filtering සමඟ
+    int targetX = map(incomingData.x, -90, 90, 0, 180);
+    int targetY = map(incomingData.y, -90, 90, 0, 180);
+    
+    targetX = constrain(targetX, 0, 180);
+    targetY = constrain(targetY, 0, 180);
+
+    smoothX = (targetX * filterAlpha) + (smoothX * (1.0 - filterAlpha));
+    smoothY = (targetY * filterAlpha) + (smoothY * (1.0 - filterAlpha));
+
+    servoX.write((int)smoothX);
+    servoY.write((int)smoothY);
+    
+    // ජොයිස්ටික් එකට මාරු වෙද්දී අවුල් නොවෙන්න currentPos අප්ඩේට් කරනවා
+    currentPosX = smoothX;
+    currentPosY = smoothY;
+  }
+  
+  delay(10); 
+}
