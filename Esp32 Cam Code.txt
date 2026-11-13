@@ -10,14 +10,14 @@
 // ===========================
 // Enter your WiFi credentials
 // ===========================
-const char *ssid = "POCO X7 Pro";
-const char *password = "sac987654321";
+const char *ssid = "Enter Wifi name";
+const char *password = "passcode";
 
 // ===========================
 // ESP32-CAM to ESP32-S3 UART
 // ===========================
-#define FIRE_UART_RX 13
-#define FIRE_UART_TX 14
+#define FIRE_UART_RX 13  // serial communication
+#define FIRE_UART_TX 14  // serial communication
 
 HardwareSerial FireSerial(1);
 
