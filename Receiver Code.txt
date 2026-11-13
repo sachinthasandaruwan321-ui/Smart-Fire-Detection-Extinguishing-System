@@ -5,21 +5,21 @@
 
 Servo servoX; Servo servoY;
 const int sXPin = 16; const int sYPin = 17;
-const int joyX = 6;  // වම-දකුණ සඳහා
-const int joyY = 15; // උඩ-පහළ සඳහා
+const int joyX = 6;  // for left-right
+const int joyY = 15; // for up-down
 
-// --- අලුතින් එකතු කළ Pump Pins ---
+// --- add new Pump Pins ---
 const int pumpPin = 21;    
 const int btnHigh = 18;  
 const int btnLow = 8;    
 
 struct DataPacket { float x; float y; } incomingData;
 
-// Smoothness එක සඳහා variables
+// for Smoothness  variables
 float smoothX = 90, smoothY = 90;
-float filterAlpha = 0.1; // 0.01 (වැඩිපුර smooth) සහ 0.5 (වේගවත්) අතර අගයක්
+float filterAlpha = 0.1; // 0.01 (more smooth) and 0.5 (fast) between values
 
-// පවතින සර්වෝ අගයන් (Joystick එකට)
+// exisiting servo values (for Joystick )
 float currentPosX = 90, currentPosY = 90;
 
 void onDataRecv(const esp_now_recv_info_t * recv_info, const uint8_t *data, int len) {
@@ -31,17 +31,17 @@ void setup() {
   servoX.attach(sXPin); 
   servoY.attach(sYPin);
   
-  // --- අලුතින් එකතු කළ Pump Setup ---
+  // --- new Pump Setup ---
   pinMode(pumpPin, OUTPUT);
   pinMode(btnHigh, INPUT_PULLUP);
   pinMode(btnLow, INPUT_PULLUP);
-  digitalWrite(pumpPin, LOW); // ආරම්භයේදී ඕෆ් කරලා තියන්න
+  digitalWrite(pumpPin, LOW); // off at the begining
 
   WiFi.mode(WIFI_STA);
   if (esp_now_init() != ESP_OK) return;
   esp_now_register_recv_cb(onDataRecv);
   
-  // ආරම්භක පිහිටීම
+  // Starting position
   servoX.write(90);
   servoY.write(90);
 }
@@ -50,30 +50,30 @@ void loop() {
   int jX = analogRead(joyX);
   int jY = analogRead(joyY);
 
-  // --- අලුතින් එකතු කළ Pump Buttons කියවීම ---
+  // ---  Pump Buttons read ---
   bool highPressed = (digitalRead(btnHigh) == LOW);
   bool lowPressed = (digitalRead(btnLow) == LOW);
 
   // ==========================================
-  // 1. Water Pump Control (මෙය Gyro එකට බාධාවක් නොවේ)
+  // 1. Water Pump Control (not affect for gyro)
   // ==========================================
   if (highPressed) {
     analogWrite(pumpPin, 255); // High Pressure (100%)
   } 
   else if (lowPressed) {
-    analogWrite(pumpPin, 120); // Low Pressure (50% - අගය වෙනස් කරගන්න පුළුවන්)
+    analogWrite(pumpPin, 120); // Low Pressure (50% - changable values)
   } 
   else {
-    analogWrite(pumpPin, 0);   // බටන් දෙකම අතෑරියම සම්පූර්ණයෙන් ඕෆ්
+    analogWrite(pumpPin, 0);   // when push the 2 buttons at the same time it reset
   }
 
   // ==========================================
   // 2. Servo Control (Joystick Override & Gyro Mode)
   // ==========================================
-  // Joystick Override Check (සෙන්ටර් එක 2048 ලෙස ගෙන)
+  // Joystick Override Check (සෙcenter 2048 ලෙselect)
   if (abs(jX - 2048) > 500 || abs(jY - 2048) > 500) {
-    // ජොයිස්ටික් එකෙන් කරන්නේ තිබ්බ තැනට අගයක් එකතු කරන එකයි (Increment)
-    float speed = 0.5; // වේගය වැඩිනම් මේක අඩු කරන්න
+    // What the joystick does is add a value to the existing position. (Increment)
+    float speed = 0.5; // Speed control
     
     if (abs(jX - 2048) > 500) currentPosX += (jX > 2048 ? speed : -speed);
     if (abs(jY - 2048) > 500) currentPosY += (jY > 2048 ? speed : -speed);
@@ -98,7 +98,7 @@ void loop() {
     servoX.write((int)smoothX);
     servoY.write((int)smoothY);
     
-    // ජොයිස්ටික් එකට මාරු වෙද්දී අවුල් නොවෙන්න currentPos අප්ඩේට් කරනවා
+    // I am updating `currentPos` to avoid issues when switching to the joystick.
     currentPosX = smoothX;
     currentPosY = smoothY;
   }
